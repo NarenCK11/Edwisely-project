@@ -1,171 +1,254 @@
 """
-llm_service.py
---------------
-AI-Powered Resume Evaluator — LLM Service
-Uses Google Gemini 2.5 Flash (FREE tier, no credit card needed).
+llm_service.py  — Multi-Provider Free LLM Service
+---------------------------------------------------
+Uses a fallback chain of FREE providers:
+  1. Groq        — 14,400 req/day, fastest (get key: console.groq.com)
+  2. Mistral     — 1 billion tokens/month  (get key: console.mistral.ai)
+  3. OpenRouter  — 50 req/day, 30+ free models (get key: openrouter.ai)
 
-Setup:
-    pip install google-generativeai
+All three use the OpenAI-compatible format — one client, swappable backends.
 
-Get your free API key at: https://aistudio.google.com
-Set in .env:  GEMINI_API_KEY=your-key-here
+Install:
+    pip install openai
+
+.env — add whichever keys you have (at least one required):
+    GROQ_API_KEY=gsk_...
+    MISTRAL_API_KEY=...
+    OPENROUTER_API_KEY=sk-or-...
 """
 
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+import time
+import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-import google.generativeai as genai
+from openai import OpenAI, RateLimitError, APIStatusError
 from flask import current_app
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Score weights  (must sum to 100)
+# Provider registry — all use OpenAI-compatible endpoints
 # ─────────────────────────────────────────────────────────────────────────────
+
+PROVIDERS = [
+    {
+        "name":        "Groq",
+        "env_key":     "GROQ_API_KEY",
+        "base_url":    "https://api.groq.com/openai/v1",
+        "model":       "llama-3.3-70b-versatile",
+    },
+    {
+        "name":        "Mistral",
+        "env_key":     "MISTRAL_API_KEY",
+        "base_url":    "https://api.mistral.ai/v1",
+        "model":       "mistral-small-latest",
+    },
+    {
+        "name":        "OpenRouter",
+        "env_key":     "OPENROUTER_API_KEY",
+        "base_url":    "https://openrouter.ai/api/v1",
+        "model":       "deepseek/deepseek-chat-v3-0324:free",
+    },
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring constants
+# ─────────────────────────────────────────────────────────────────────────────
+
 WEIGHTS = {
-    "skill_match":        40,
-    "experience_depth":   25,
-    "role_alignment":     20,
-    "project_strength":   10,
-    "education_bonus":     5,
+    "skill_match":      40,
+    "experience_depth": 25,
+    "role_alignment":   20,
+    "project_strength": 10,
+    "education_bonus":   5,
 }
 
-# Tag thresholds
 FIT_TAG_THRESHOLDS = [
     (75, "Excellent"),
     (50, "Good"),
     (0,  "Poor"),
 ]
 
-# Section header keywords used by the rule-based resume parser
-SECTION_KEYWORDS = {
-    "skills":          ["skill", "technologies", "tech stack", "competencies", "tools", "languages"],
-    "experience":      ["experience", "employment", "work history", "career", "positions held"],
-    "education":       ["education", "academic", "qualification", "degree", "university", "college"],
-    "projects":        ["project", "portfolio", "built", "developed", "created"],
-    "extracurriculars":["extracurricular", "volunteer", "activities", "leadership", "clubs", "awards", "certifications"],
-}
-
-# Common skill synonyms — rule-based normalisation
 SKILL_SYNONYMS: Dict[str, str] = {
-    "js": "javascript",
-    "ts": "typescript",
-    "node": "node.js",
-    "nodejs": "node.js",
-    "react.js": "react",
-    "reactjs": "react",
-    "vue.js": "vue",
-    "vuejs": "vue",
-    "py": "python",
-    "ml": "machine learning",
-    "dl": "deep learning",
-    "nlp": "natural language processing",
-    "k8s": "kubernetes",
-    "gcp": "google cloud",
-    "aws": "amazon web services",
-    "ci/cd": "cicd",
-    "postgres": "postgresql",
-    "mongo": "mongodb",
-    "rest api": "rest",
-    "restful": "rest",
-    "restful api": "rest",
+    "js": "javascript", "ts": "typescript",
+    "node": "node.js", "nodejs": "node.js",
+    "react.js": "react", "reactjs": "react",
+    "vue.js": "vue", "vuejs": "vue",
+    "py": "python", "ml": "machine learning",
+    "dl": "deep learning", "nlp": "natural language processing",
+    "k8s": "kubernetes", "gcp": "google cloud",
+    "aws": "amazon web services", "ci/cd": "cicd",
+    "postgres": "postgresql", "mongo": "mongodb",
+    "rest api": "rest", "restful": "rest", "restful api": "rest",
     "oop": "object oriented programming",
 }
 
+_COMMON_SKILLS = {
+    "python", "javascript", "typescript", "java", "c++", "c#", "go", "rust",
+    "react", "vue", "angular", "node.js", "django", "flask", "fastapi", "spring",
+    "sql", "postgresql", "mysql", "mongodb", "redis", "elasticsearch",
+    "aws", "google cloud", "azure", "docker", "kubernetes", "terraform",
+    "git", "linux", "rest", "graphql", "machine learning", "deep learning",
+    "tensorflow", "pytorch", "scikit-learn", "pandas", "numpy",
+    "html", "css", "tailwind", "figma", "agile", "scrum",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gemini client helpers
+# Provider client — OpenAI-compatible for ALL providers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_model() -> genai.GenerativeModel:
-    api_key = current_app.config.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured in your .env / Flask config")
-    genai.configure(api_key=api_key)
-    model_name = current_app.config.get("GEMINI_MODEL", "gemini-2.5-flash")
-    return genai.GenerativeModel(model_name)
+def _get_configured_providers() -> List[Dict]:
+    """Return only providers that have an API key set in config."""
+    configured = []
+    for p in PROVIDERS:
+        key = current_app.config.get(p["env_key"])
+        if key:
+            configured.append({**p, "api_key": key})
+    return configured
 
 
-def _call_gemini(prompt: str, system_instruction: str = "") -> str:
+def _call_llm(system: str, user: str) -> str:
     """
-    Send a prompt to Gemini and return the text response.
-    All prompts end with an explicit 'JSON only' reminder to reduce hallucinations.
+    Try each configured provider in order.
+    On 429 RateLimitError, silently move to the next provider.
+    Raises the last error if all providers fail.
     """
-    model = _get_model()
-    full_prompt = (
-        f"{system_instruction}\n\n{prompt}\n\n"
-        "IMPORTANT: Respond with ONLY raw valid JSON. "
-        "No markdown, no code fences, no explanation, no trailing text."
-    )
-    generation_config = genai.types.GenerationConfig(
+    providers = _get_configured_providers()
+    if not providers:
+        raise RuntimeError(
+            "No LLM API keys configured. "
+            "Add at least one of: GROQ_API_KEY, MISTRAL_API_KEY, OPENROUTER_API_KEY to your .env"
+        )
+
+    last_error = None
+    for p in providers:
+        try:
+            logger.info("Calling %s / %s", p["name"], p["model"])
+            client = OpenAI(api_key=p["api_key"], base_url=p["base_url"])
+            resp = client.chat.completions.create(
+                model=p["model"],
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+                temperature=0.0,
+                max_tokens=2048,
+            )
+            text = resp.choices[0].message.content or ""
+            logger.info("Success with %s", p["name"])
+            return text.strip()
+
+        except (RateLimitError, APIStatusError) as e:
+            code = getattr(e, "status_code", None)
+            if code == 429 or isinstance(e, RateLimitError):
+                logger.warning("%s quota hit — trying next provider.", p["name"])
+                last_error = e
+                continue
+            logger.error("%s API error %s — trying next.", p["name"], code)
+            last_error = e
+            continue
+
+        except Exception as e:
+            logger.warning("%s unexpected error: %s — trying next.", p["name"], str(e)[:100])
+            last_error = e
+            continue
+
+    # All failed — wait 60s and retry first provider once
+    logger.warning("All providers exhausted. Waiting 60s then retrying %s...", providers[0]["name"])
+    time.sleep(60)
+    client = OpenAI(api_key=providers[0]["api_key"], base_url=providers[0]["base_url"])
+    resp = client.chat.completions.create(
+        model=providers[0]["model"],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
         temperature=0.0,
-        max_output_tokens=2048,
+        max_tokens=2048,
     )
-    response = model.generate_content(
-        full_prompt,
-        generation_config=generation_config,
-    )
-    return (response.text or "").strip()
+    return (resp.choices[0].message.content or "").strip()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON parsing
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _strip_fences(text: str) -> str:
-    """Remove ```json ... ``` or ``` ... ``` wrappers if Gemini adds them anyway."""
     text = text.strip()
     text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
     text = re.sub(r"\n?```$", "", text)
     return text.strip()
 
 
+def _extract_json_object(text: str) -> Optional[str]:
+    s = _strip_fences(text)
+    start = s.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == "{":   depth += 1
+        elif s[i] == "}": depth -= 1
+        if depth == 0:
+            return s[start:i + 1]
+    end = s.rfind("}")
+    return s[start:end + 1] if end > start else None
+
+
 def _parse_json(raw: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(_strip_fences(raw))
     except json.JSONDecodeError:
-        logger.warning("JSON parse failed. Raw response: %s", raw[:300])
+        extracted = _extract_json_object(raw)
+        if extracted:
+            try:
+                return json.loads(extracted)
+            except json.JSONDecodeError:
+                pass
+        logger.warning("JSON parse failed. Snippet: %s", raw[:200])
         return None
 
 
-def _call_gemini_with_retry(prompt: str, system_instruction: str = "") -> Optional[Dict[str, Any]]:
-    """Call Gemini, parse JSON. If it fails, retry once with a stricter prompt."""
+def _call_with_json_retry(system: str, user: str) -> Optional[Dict[str, Any]]:
+    """Call LLM, parse JSON. Retry once with stricter prompt on parse failure."""
     try:
-        raw = _call_gemini(prompt, system_instruction)
-        parsed = _parse_json(raw)
-        if parsed is not None:
-            return parsed
+        raw = _call_llm(system, user)
+        result = _parse_json(raw)
+        if result is not None:
+            return result
 
-        logger.info("First parse failed — retrying with stricter prompt.")
-        retry_prompt = (
-            "Your last response was NOT valid JSON. "
-            "This time output ONLY a raw JSON object. "
-            "No explanation, no code fences, no comments, no trailing commas.\n\n"
-            + prompt
+        logger.info("Parse failed — retrying with stricter instructions.")
+        raw2 = _call_llm(
+            system,
+            "Your previous response was not valid JSON.\n"
+            "Output ONLY a raw JSON object. No markdown, no explanation, no trailing text.\n\n"
+            + user
         )
-        raw_retry = _call_gemini(retry_prompt, system_instruction)
-        return _parse_json(raw_retry)
+        return _parse_json(raw2)
+
     except Exception:
-        logger.exception("Gemini API call failed")
+        logger.exception("LLM call failed completely")
         return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rule-based text processing helpers
+# Rule-based helpers  (zero API cost)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _normalise_skill(skill: str) -> str:
-    """Lowercase + apply synonym map."""
-    cleaned = skill.strip().lower()
-    return SKILL_SYNONYMS.get(cleaned, cleaned)
+def _normalise_skill(s: str) -> str:
+    return SKILL_SYNONYMS.get(s.strip().lower(), s.strip().lower())
 
 
 def _normalise_skills(skills: List[str]) -> List[str]:
-    seen, result = set(), []
+    seen, out = set(), []
     for s in skills:
-        norm = _normalise_skill(s)
-        if norm and norm not in seen:
-            seen.add(norm)
-            result.append(norm)
-    return result
+        n = _normalise_skill(s)
+        if n and n not in seen:
+            seen.add(n); out.append(n)
+    return out
 
 
 def _compute_fit_tag(score: float) -> str:
@@ -175,301 +258,296 @@ def _compute_fit_tag(score: float) -> str:
     return "Poor"
 
 
-def _validate_and_clamp_scores(scoring: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Rule-based post-processing on LLM score output:
-    1. Clamp every sub-score to its allowed max.
-    2. Recompute total_score from sub-scores (never trust LLM arithmetic).
-    3. Add fit_tag.
-    """
-    scoring["skill_match_score"]      = max(0.0, min(float(scoring.get("skill_match_score",      0)), WEIGHTS["skill_match"]))
-    scoring["experience_depth_score"] = max(0.0, min(float(scoring.get("experience_depth_score", 0)), WEIGHTS["experience_depth"]))
-    scoring["role_alignment_score"]   = max(0.0, min(float(scoring.get("role_alignment_score",   0)), WEIGHTS["role_alignment"]))
-    scoring["project_strength_score"] = max(0.0, min(float(scoring.get("project_strength_score", 0)), WEIGHTS["project_strength"]))
-    scoring["education_bonus_score"]  = max(0.0, min(float(scoring.get("education_bonus_score",  0)), WEIGHTS["education_bonus"]))
-
-    total = round(
-        scoring["skill_match_score"]
-        + scoring["experience_depth_score"]
-        + scoring["role_alignment_score"]
-        + scoring["project_strength_score"]
-        + scoring["education_bonus_score"],
-        1,
-    )
-    scoring["total_score"] = min(total, 100.0)
-    scoring["fit_tag"]     = _compute_fit_tag(scoring["total_score"])
-    return scoring
-
-
-def _compute_skill_match_rule(
+def _compute_skill_match(
     candidate_skills: List[str],
-    required_skills: List[str],
+    required_skills:  List[str],
     preferred_skills: List[str],
 ) -> Dict[str, Any]:
-    """
-    Pure rule-based skill match (no LLM needed).
-    Returns matched, missing lists and raw skill_match_score.
-    """
-    cand_norm      = set(_normalise_skills(candidate_skills))
-    required_norm  = _normalise_skills(required_skills)
-    preferred_norm = _normalise_skills(preferred_skills)
+    cand  = set(_normalise_skills(candidate_skills))
+    req   = _normalise_skills(required_skills)
+    pref  = _normalise_skills(preferred_skills)
 
-    matched_required  = [s for s in required_norm  if s in cand_norm]
-    missing_required  = [s for s in required_norm  if s not in cand_norm]
-    matched_preferred = [s for s in preferred_norm if s in cand_norm]
+    matched_req  = [s for s in req  if s in cand]
+    missing_req  = [s for s in req  if s not in cand]
+    matched_pref = [s for s in pref if s in cand]
 
-    req_ratio  = (len(matched_required)  / len(required_norm))  if required_norm  else 0
-    pref_ratio = (len(matched_preferred) / len(preferred_norm)) if preferred_norm else 0
-
-    skill_score = round((req_ratio * 30) + (pref_ratio * 10), 1)
+    req_r  = len(matched_req)  / len(req)  if req  else 0
+    pref_r = len(matched_pref) / len(pref) if pref else 0
 
     return {
-        "skill_match_score": skill_score,
-        "matched_skills":    matched_required + matched_preferred,
-        "missing_skills":    missing_required,
+        "skill_match_score": round((req_r * 30) + (pref_r * 10), 1),
+        "matched_skills":    matched_req + matched_pref,
+        "missing_skills":    missing_req,
     }
 
 
-def _compute_experience_rule(
-    candidate_years: float,
-    min_required_years: float,
-) -> float:
-    """
-    Rule-based experience sub-score out of 25.
-    Full score if meets requirement, scaled down if below, small bonus if well above.
-    """
-    if min_required_years <= 0:
-        return 20.0
+def _compute_experience_score(candidate_years: float, min_required: float) -> float:
+    if min_required <= 0: return 20.0
+    r = candidate_years / min_required
+    if r >= 1.5:  return 25.0
+    if r >= 1.0:  return round(20.0 + (r - 1.0) * 10,  1)
+    if r >= 0.75: return round(15.0 + (r - 0.75) * 20, 1)
+    if r >= 0.5:  return round(8.0  + (r - 0.5)  * 28, 1)
+    return round(r * 16, 1)
 
-    ratio = candidate_years / min_required_years
-    if ratio >= 1.5:
-        return 25.0
-    elif ratio >= 1.0:
-        return 20.0 + (ratio - 1.0) * 10
-    elif ratio >= 0.75:
-        return 15.0 + (ratio - 0.75) * 20
-    elif ratio >= 0.5:
-        return 8.0  + (ratio - 0.5)  * 28
-    else:
-        return round(ratio * 16, 1)
+
+def _clamp_and_tag(s: Dict[str, Any]) -> Dict[str, Any]:
+    for key, cap in [
+        ("skill_match_score",      WEIGHTS["skill_match"]),
+        ("experience_depth_score", WEIGHTS["experience_depth"]),
+        ("role_alignment_score",   WEIGHTS["role_alignment"]),
+        ("project_strength_score", WEIGHTS["project_strength"]),
+        ("education_bonus_score",  WEIGHTS["education_bonus"]),
+    ]:
+        s[key] = max(0.0, min(float(s.get(key, 0)), cap))
+
+    s["total_score"] = min(round(sum([
+        s["skill_match_score"], s["experience_depth_score"],
+        s["role_alignment_score"], s["project_strength_score"],
+        s["education_bonus_score"],
+    ]), 1), 100.0)
+    s["fit_tag"] = _compute_fit_tag(s["total_score"])
+    return s
+
+
+def _quick_extract_skills(text: str) -> List[str]:
+    lower = text.lower()
+    found = [s for s in _COMMON_SKILLS if s in lower]
+    tech  = re.findall(r'\b[A-Z][a-zA-Z]+(?:\.[a-zA-Z]+)*\b|\b\w+\+\+\b|\b\w+\.js\b', text)
+    return list(set(found + [t.lower() for t in tech[:20]]))
+
+
+def _quick_extract_jd(jd: str) -> Tuple[List[str], List[str], float]:
+    lower = jd.lower()
+    min_years = 0.0
+    for pat in [
+        r'(\d+)\+?\s*(?:to\s*\d+\s*)?years?\s*(?:of\s*)?(?:experience|exp)',
+        r'minimum\s+(\d+)\s*years?', r'at\s+least\s+(\d+)\s*years?',
+    ]:
+        m = re.search(pat, lower)
+        if m: min_years = float(m.group(1)); break
+
+    req_sec, pref_sec, cur = "", "", "required"
+    for line in jd.split("\n"):
+        ll = line.lower()
+        if any(w in ll for w in ["preferred","nice to have","bonus","desirable"]): cur = "preferred"
+        elif any(w in ll for w in ["required","must have","mandatory"]): cur = "required"
+        if cur == "required": req_sec  += " " + line
+        else:                 pref_sec += " " + line
+
+    req  = [s for s in _COMMON_SKILLS if s in req_sec.lower()]
+    pref = [s for s in _COMMON_SKILLS if s in pref_sec.lower() and s not in req]
+    if not req: req = [s for s in _COMMON_SKILLS if s in lower]
+    return req, pref, min_years
+
+
+def _quick_extract_years(text: str) -> float:
+    yr = datetime.datetime.now().year
+    ranges = re.findall(
+        r'(20\d{2}|19\d{2})\s*[-\u2013\u2014to]+\s*(20\d{2}|19\d{2}|present|current|now)',
+        text.lower()
+    )
+    total = 0.0
+    for s, e in ranges:
+        try:
+            start = int(s)
+            end   = yr if e in ("present","current","now") else int(e)
+            d     = max(0, end - start)
+            if 0 < d <= 20: total += d
+        except ValueError:
+            continue
+    if total > 0: return min(total, 40.0)
+    count = len(re.findall(
+        r'\b(engineer|developer|analyst|manager|lead|intern|consultant|designer)\b',
+        text.lower()
+    ))
+    return min(float(count) * 1.5, 15.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public functions
+# Single combined LLM prompt
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = (
+    "You are an expert resume evaluator. "
+    "You receive a resume, a job description, and pre-computed rule-based scores. "
+    "Fill in ONLY the fields marked YOUR TASK. "
+    "Return ONLY raw valid JSON — no markdown, no explanation, no code fences."
+)
+
+_USER_TEMPLATE = """Pre-computed scores (copy these EXACTLY into your response):
+  skill_match_score      = {skill_match_score}
+  experience_depth_score = {experience_depth_score}
+  matched_skills         = {matched_skills}
+  missing_skills         = {missing_skills}
+
+YOUR TASK — score and analyse:
+  role_alignment_score   : number 0–{max_align}  (candidate responsibilities vs JD responsibilities)
+  project_strength_score : number 0–{max_proj}   (project relevance, tech overlap, outcomes)
+  education_bonus_score  : number 0–{max_edu}    (meets/exceeds education requirement)
+  strengths              : list of 2–4 specific strengths for THIS role
+  gaps                   : list of 2–4 honest gaps or missing items
+  suggestions            : list of exactly 3 concrete improvements
+  summary                : 2–3 sentence overall fit assessment
+  candidate_name         : string or null
+  candidate_email        : string or null
+  candidate_phone        : string or null
+  total_experience_years : number
+
+Return this JSON structure (fill in the zeroes/nulls/empty arrays):
+{{
+  "candidate_name":          null,
+  "candidate_email":         null,
+  "candidate_phone":         null,
+  "total_experience_years":  0,
+  "skill_match_score":       {skill_match_score},
+  "experience_depth_score":  {experience_depth_score},
+  "role_alignment_score":    0,
+  "project_strength_score":  0,
+  "education_bonus_score":   0,
+  "matched_skills":          {matched_skills},
+  "missing_skills":          {missing_skills},
+  "strengths":               [],
+  "gaps":                    [],
+  "suggestions":             [],
+  "summary":                 ""
+}}
+
+--- RESUME ---
+{resume_text}
+
+--- JOB DESCRIPTION ---
+{jd_text}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_candidate(resume_text: str, jd_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Main entry point — ONE API call per evaluation.
+
+    In your evaluate route:
+        result = evaluate_candidate(candidate.resume_text, jd.description)
+        if result:
+            candidate.fit_score            = result["total_score"]
+            candidate.fit_tag              = result["fit_tag"]
+            candidate.skill_match_score    = result["skill_match_score"]
+            candidate.experience_score     = result["experience_depth_score"]
+            candidate.role_alignment_score = result["role_alignment_score"]
+            candidate.project_score        = result["project_strength_score"]
+            candidate.education_score      = result["education_bonus_score"]
+            candidate.matched_skills       = json.dumps(result["matched_skills"])
+            candidate.missing_skills       = json.dumps(result["missing_skills"])
+            candidate.strengths            = json.dumps(result["strengths"])
+            candidate.gaps                 = json.dumps(result["gaps"])
+            candidate.suggestions          = json.dumps(result["suggestions"])
+            candidate.summary              = result["summary"]
+            candidate.is_evaluated         = True
+    """
+    if not resume_text or len(resume_text.strip()) < 50:
+        logger.warning("Resume text too short — skipping")
+        return None
+    if not jd_text or len(jd_text.strip()) < 30:
+        logger.warning("JD text too short — skipping")
+        return None
+
+    # Step 1 — Rule-based (free, instant)
+    req_skills, pref_skills, min_years = _quick_extract_jd(jd_text)
+    skill_result = _compute_skill_match(
+        _quick_extract_skills(resume_text), req_skills, pref_skills
+    )
+    exp_score = _compute_experience_score(
+        _quick_extract_years(resume_text), min_years
+    )
+
+    # Step 2 — One LLM call across all providers
+    prompt = _USER_TEMPLATE.format(
+        skill_match_score      = skill_result["skill_match_score"],
+        experience_depth_score = round(exp_score, 1),
+        matched_skills         = json.dumps(skill_result["matched_skills"]),
+        missing_skills         = json.dumps(skill_result["missing_skills"]),
+        max_align              = WEIGHTS["role_alignment"],
+        max_proj               = WEIGHTS["project_strength"],
+        max_edu                = WEIGHTS["education_bonus"],
+        resume_text            = resume_text[:3000],
+        jd_text                = jd_text[:2000],
+    )
+
+    result = _call_with_json_retry(_SYSTEM_PROMPT, prompt)
+
+    if result is None:
+        logger.warning("All providers failed — returning rule-based fallback")
+        return _fallback_result(skill_result, exp_score)
+
+    # Step 3 — Lock in rule-based scores
+    result["skill_match_score"]      = skill_result["skill_match_score"]
+    result["experience_depth_score"] = round(exp_score, 1)
+    result["matched_skills"]         = skill_result["matched_skills"]
+    result["missing_skills"]         = skill_result["missing_skills"]
+
+    # Step 4 — Clamp, recompute total, add fit_tag
+    return _clamp_and_tag(result)
+
+
+def _fallback_result(skill_result: Dict, exp_score: float) -> Dict[str, Any]:
+    return _clamp_and_tag({
+        "candidate_name": None, "candidate_email": None, "candidate_phone": None,
+        "total_experience_years":  0,
+        "skill_match_score":       skill_result["skill_match_score"],
+        "experience_depth_score":  round(exp_score, 1),
+        "role_alignment_score":    0,
+        "project_strength_score":  0,
+        "education_bonus_score":   0,
+        "matched_skills":          skill_result["matched_skills"],
+        "missing_skills":          skill_result["missing_skills"],
+        "strengths":   ["LLM unavailable — rule-based scores only"],
+        "gaps":        ["Re-evaluate when a provider quota resets"],
+        "suggestions": [
+            "Wait for API quota to reset (usually resets daily)",
+            "Add another provider key to .env for automatic fallback",
+            "Try evaluating again in a few minutes",
+        ],
+        "summary": "Partial evaluation using rule-based scoring only. Re-evaluate for full LLM analysis.",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy shims — keeps old route code working without any changes
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_resume_structure(resume_text: str) -> Optional[Dict[str, Any]]:
-    """
-    Extract structured data from resume text.
-    Strategy: LLM handles free-form parsing, rules handle normalisation.
-    """
     if not resume_text or len(resume_text.strip()) < 50:
-        logger.warning("Resume text too short — skipping LLM extraction")
         return None
-
-    system_instruction = (
-        "You are an expert resume parser. "
-        "Extract every piece of information from the resume into the JSON schema provided. "
-        "Be thorough: include all skills, jobs, projects, and education entries. "
-        "If a field is not found, use null or an empty array. "
-        "Do not invent information."
-    )
-    schema = """{
-  "name":                    "string or null",
-  "email":                   "string or null",
-  "phone":                   "string or null",
-  "skills":                  ["list of ALL technical and soft skills mentioned"],
-  "total_experience_years":  "number (estimate total years of work experience)",
-  "experience": [
-    {
-      "company":         "string",
-      "role":            "string",
-      "duration_years":  "number",
-      "highlights":      ["list of key achievements or responsibilities"]
+    return {
+        "skills": _quick_extract_skills(resume_text),
+        "total_experience_years": _quick_extract_years(resume_text),
+        "experience": [], "education": [], "projects": [], "extracurriculars": [],
     }
-  ],
-  "education": [
-    {
-      "degree":      "string",
-      "institution": "string",
-      "year":        "string or null"
-    }
-  ],
-  "projects": [
-    {
-      "name":        "string",
-      "tech_stack":  ["list of technologies used"],
-      "description": "string"
-    }
-  ],
-  "extracurriculars": ["list of activities, certifications, awards, volunteering"]
-}"""
-
-    prompt = (
-        f"Parse the resume below into this exact JSON schema.\n"
-        f"Schema:\n{schema}\n\n"
-        f"Resume Text:\n{resume_text}"
-    )
-
-    parsed = _call_gemini_with_retry(prompt, system_instruction)
-    if parsed is None:
-        return None
-
-    if isinstance(parsed.get("skills"), list):
-        parsed["skills"] = _normalise_skills(parsed["skills"])
-    if isinstance(parsed.get("total_experience_years"), str):
-        try:
-            parsed["total_experience_years"] = float(parsed["total_experience_years"])
-        except ValueError:
-            parsed["total_experience_years"] = 0.0
-
-    return parsed
 
 
 def extract_jd_structure(jd_text: str) -> Optional[Dict[str, Any]]:
-    """
-    Extract structured requirements from a job description.
-    Strategy: LLM handles parsing, rules normalise skills.
-    """
     if not jd_text or len(jd_text.strip()) < 30:
-        logger.warning("JD text too short — skipping extraction")
         return None
-
-    system_instruction = (
-        "You are an expert at parsing job descriptions for HR and recruiting software. "
-        "Extract every requirement, skill, and expectation into the JSON schema provided. "
-        "Separate must-have (required) skills from nice-to-have (preferred) skills carefully. "
-        "Do not invent requirements not present in the text."
-    )
-    schema = """{
-  "role_title":             "string",
-  "required_skills":        ["must-have skills listed explicitly"],
-  "preferred_skills":       ["nice-to-have or preferred skills"],
-  "min_experience_years":   "number (use 0 if not stated)",
-  "responsibilities":       ["list of key job responsibilities"],
-  "education_requirements": "string or null",
-  "domain_keywords":        ["important domain or industry terms from the JD"]
-}"""
-
-    prompt = (
-        f"Parse the job description below into this exact JSON schema.\n"
-        f"Schema:\n{schema}\n\n"
-        f"Job Description Text:\n{jd_text}"
-    )
-
-    parsed = _call_gemini_with_retry(prompt, system_instruction)
-    if parsed is None:
-        return None
-
-    if isinstance(parsed.get("required_skills"), list):
-        parsed["required_skills"] = _normalise_skills(parsed["required_skills"])
-    if isinstance(parsed.get("preferred_skills"), list):
-        parsed["preferred_skills"] = _normalise_skills(parsed["preferred_skills"])
-    if isinstance(parsed.get("min_experience_years"), str):
-        try:
-            parsed["min_experience_years"] = float(parsed["min_experience_years"])
-        except ValueError:
-            parsed["min_experience_years"] = 0.0
-
-    return parsed
-
-
-def score_candidate(
-    resume_json: Dict[str, Any],
-    jd_json: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """
-    Score a candidate against a JD using a HYBRID approach:
-    - skill_match_score    → 100% rule-based (exact + synonym matching)
-    - experience_score     → 100% rule-based (years ratio formula)
-    - role_alignment_score → LLM (requires semantic understanding)
-    - project_strength     → LLM (requires qualitative judgement)
-    - education_bonus      → LLM (varies by field and role context)
-    - strengths/gaps/suggestions/summary → LLM
-    """
-
-    # ── Step 1: Rule-based scores (no LLM cost) ──────────────────────────────
-    skill_result = _compute_skill_match_rule(
-        candidate_skills  = resume_json.get("skills", []),
-        required_skills   = jd_json.get("required_skills", []),
-        preferred_skills  = jd_json.get("preferred_skills", []),
-    )
-
-    experience_score = _compute_experience_rule(
-        candidate_years    = float(resume_json.get("total_experience_years") or 0),
-        min_required_years = float(jd_json.get("min_experience_years") or 0),
-    )
-
-    # ── Step 2: LLM-only scores (semantic/qualitative dimensions) ─────────────
-    system_instruction = (
-        "You are a senior technical recruiter scoring a candidate against a job description.\n"
-        "You will be given pre-computed scores for skill_match and experience_depth — "
-        "DO NOT change those fields, just include them as-is.\n"
-        "Score the remaining three dimensions honestly and return the JSON schema below.\n\n"
-        "Scoring rules:\n"
-        f"- role_alignment_score: 0–{WEIGHTS['role_alignment']} pts. "
-        "How closely do the candidate's past responsibilities and domain keywords match the JD responsibilities?\n"
-        f"- project_strength_score: 0–{WEIGHTS['project_strength']} pts. "
-        "Are the candidate's projects relevant? Do they show measurable outcomes or tech stack overlap with JD?\n"
-        f"- education_bonus_score: 0–{WEIGHTS['education_bonus']} pts. "
-        "Does the candidate meet or exceed the stated education requirement?\n"
-        "- strengths: 2–4 specific positive points about this candidate for this role.\n"
-        "- gaps: 2–4 honest weaknesses or missing items.\n"
-        "- suggestions: 3 concrete improvements the candidate could make to strengthen their profile.\n"
-        "- summary: 2–3 sentences: overall fit assessment.\n"
-        "Be specific and evidence-based. No generic praise."
-    )
-
-    schema = f"""{{
-  "role_alignment_score":     "number 0–{WEIGHTS['role_alignment']}",
-  "project_strength_score":   "number 0–{WEIGHTS['project_strength']}",
-  "education_bonus_score":    "number 0–{WEIGHTS['education_bonus']}",
-  "strengths":                ["string", "string", ...],
-  "gaps":                     ["string", "string", ...],
-  "suggestions":              ["string", "string", "string"],
-  "summary":                  "string"
-}}"""
-
-    prompt = (
-        f"Pre-computed (do not change):\n"
-        f"  skill_match_score = {skill_result['skill_match_score']}\n"
-        f"  experience_depth_score = {round(experience_score, 1)}\n\n"
-        f"Matched skills (for context): {skill_result['matched_skills']}\n"
-        f"Missing skills (for context): {skill_result['missing_skills']}\n\n"
-        f"Output schema:\n{schema}\n\n"
-        f"Candidate Resume JSON:\n{json.dumps(resume_json, ensure_ascii=False)}\n\n"
-        f"Job Description JSON:\n{json.dumps(jd_json, ensure_ascii=False)}"
-    )
-
-    llm_result = _call_gemini_with_retry(prompt, system_instruction)
-
-    if llm_result is None:
-        logger.warning("LLM scoring failed — falling back to rule-based scores only")
-        llm_result = {
-            "role_alignment_score":   0,
-            "project_strength_score": 0,
-            "education_bonus_score":  0,
-            "strengths":   ["Could not be evaluated — LLM service unavailable"],
-            "gaps":        ["Could not be evaluated — LLM service unavailable"],
-            "suggestions": ["Re-run evaluation when the LLM service is available"],
-            "summary":     "Automatic evaluation failed. Partial rule-based scores are shown.",
-        }
-
-    # ── Step 3: Merge rule-based + LLM scores ─────────────────────────────────
-    merged = {
-        "skill_match_score":      skill_result["skill_match_score"],
-        "experience_depth_score": round(experience_score, 1),
-        "role_alignment_score":   llm_result.get("role_alignment_score", 0),
-        "project_strength_score": llm_result.get("project_strength_score", 0),
-        "education_bonus_score":  llm_result.get("education_bonus_score", 0),
-        "matched_skills":         skill_result["matched_skills"],
-        "missing_skills":         skill_result["missing_skills"],
-        "strengths":              llm_result.get("strengths", []),
-        "gaps":                   llm_result.get("gaps", []),
-        "suggestions":            llm_result.get("suggestions", []),
-        "summary":                llm_result.get("summary", ""),
+    req, pref, min_yrs = _quick_extract_jd(jd_text)
+    return {
+        "required_skills": req, "preferred_skills": pref,
+        "min_experience_years": min_yrs,
+        "responsibilities": [], "domain_keywords": [],
     }
 
-    # ── Step 4: Rule-based validation, clamping, and fit_tag ─────────────────
-    return _validate_and_clamp_scores(merged)
 
+def score_candidate(resume_json: Dict, jd_json: Dict) -> Optional[Dict[str, Any]]:
+    """Legacy shim — new code should call evaluate_candidate() directly."""
+    sr = _compute_skill_match(
+        resume_json.get("skills", []),
+        jd_json.get("required_skills", []),
+        jd_json.get("preferred_skills", []),
+    )
+    es = _compute_experience_score(
+        float(resume_json.get("total_experience_years") or 0),
+        float(jd_json.get("min_experience_years") or 0),
+    )
+    return _fallback_result(sr, es)

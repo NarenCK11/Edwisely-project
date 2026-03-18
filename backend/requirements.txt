@@ -4,6 +4,7 @@ flask-jwt-extended
 flask-cors
 pdfplumber
 google-generativeai
+openai
 python-dotenv
 werkzeug
 gunicorn
