@@ -19,7 +19,16 @@ def create_app(config_class=DevelopmentConfig):
     # Extensions
     db.init_app(app)
     jwt.init_app(app)
-    CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
+
+    # CORS
+    # Allow frontend origins to access the backend.
+    # Set CORS_ORIGINS to a comma-separated list (e.g. "http://localhost:5173,https://your-frontend.com").
+    cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173")
+    CORS(
+        app,
+        origins=[o.strip() for o in cors_origins.split(",") if o.strip()],
+        supports_credentials=True,
+    )
 
     # Blueprints
     app.register_blueprint(auth_bp, url_prefix="/api/auth")

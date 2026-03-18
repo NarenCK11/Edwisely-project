@@ -1,13 +1,13 @@
 ## AI-Powered Resume Evaluator
 
-Full-stack web app for HR teams to upload job descriptions and resumes, then rank candidates using a hybrid **rule-based + Gemini LLM** scoring engine.
+Full-stack web app for HR teams to upload job descriptions and resumes, then rank candidates using a hybrid **rule-based + LLM scoring** engine.
 
 ### Tech Stack
 
-- **Backend**: Python, Flask, Flask-SQLAlchemy, Flask-JWT-Extended, Flask-CORS, pdfplumber, google-generativeai
+- **Backend**: Python, Flask, Flask-SQLAlchemy, Flask-JWT-Extended, Flask-CORS, pdfplumber
 - **Frontend**: React (Vite-style), React Router v6, Axios, Recharts
 - **Database**: SQLite via SQLAlchemy ORM
-- **LLM**: Google Gemini 2.5 Flash
+- **LLM**: OpenAI-compatible providers (Groq / Mistral / OpenRouter)
 
 ---
 
@@ -17,7 +17,7 @@ Full-stack web app for HR teams to upload job descriptions and resumes, then ran
 - **Node.js**: 18+ (20+ recommended for Vite)
 - **npm**: 9+
 
-You also need a free Gemini API key from [Google AI Studio](https://aistudio.google.com).
+You also need at least one API key for an OpenAI-compatible provider (Groq / Mistral / OpenRouter). See `backend/services/llm_service.py` for the supported env vars.
 
 ---
 
